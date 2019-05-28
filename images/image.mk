@@ -17,28 +17,26 @@
 
 override GOOS=linux
 
+DOCKERCMD := docker
+
 # include the common make file
 SELF_DIR := $(dir $(lastword $(MAKEFILE_LIST)))
 include $(SELF_DIR)/../build/makelib/common.mk
 
-ifneq ($(GOHOSTARCH),amd64)
-$(error image build only supported on amd64 host currently)
-endif
-
 # the registry used for cached images
 CACHE_REGISTRY := cache
 
-# the base ubuntu image to use
-OSBASE ?= ubuntu:xenial
+# the base image to use
+OSBASE ?= centos:7
 
 ifeq ($(GOARCH),amd64)
-OSBASEIMAGE=$(OSBASE)
-endif
-ifeq ($(GOARCH),arm)
-OSBASEIMAGE=arm32v7/$(OSBASE)
-endif
-ifeq ($(GOARCH),arm64)
-OSBASEIMAGE=arm64v8/$(OSBASE)
+PLATFORM_ARCH = x86_64
+OSBASEIMAGE = $(OSBASE)
+else ifeq ($(GOARCH),arm64)
+PLATFORM_ARCH = aarch64
+OSBASEIMAGE = arm64v8/$(OSBASE)
+else
+$(error Unknown go architecture $(GOARCH))
 endif
 
 # if we are running inside the container get our own cid
@@ -85,24 +83,24 @@ clean: clean.build
 prune: cache.prune
 
 clean.images:
-	@for i in $(IMAGES); do \
-		if [ -n "$$(docker images -q $$i)" ]; then \
-			for c in $$(docker ps -a -q --no-trunc --filter=ancestor=$$i); do \
+	@for i in $(CLEAN_IMAGES); do \
+		if [ -n "$$($(DOCKERCMD) images -q $$i)" ]; then \
+			for c in $$($(DOCKERCMD) ps -a -q --no-trunc --filter=ancestor=$$i); do \
 				if [ "$$c" != "$(SELF_CID)" ]; then \
 					echo stopping and removing container $${c} referencing image $$i; \
-					docker stop $${c}; \
-					docker rm $${c}; \
+					$(DOCKERCMD) stop $${c}; \
+					$(DOCKERCMD) rm $${c}; \
 				fi; \
 			done; \
 			echo cleaning image $$i; \
-			docker rmi $$i > /dev/null 2>&1 || true; \
+			$(DOCKERCMD) rmi $$i > /dev/null 2>&1 || true; \
 		fi; \
 	done
 
 # this will clean everything for this build
 clean.build:
 	@echo === cleaning images for $(BUILD_REGISTRY)
-	@$(MAKE) clean.images IMAGES="$(shell docker images | grep -E '^$(BUILD_REGISTRY)/' | awk '{print $$1":"$$2}')"
+	@$(MAKE) clean.images CLEAN_IMAGES="$(shell $(DOCKERCMD) images | grep -E '^$(BUILD_REGISTRY)/' | awk '{print $$1":"$$2}')"
 
 # =====================================================================================
 # Caching
@@ -132,22 +130,22 @@ CACHE_TAG := $(shell date -u +"$(CACHE_DATE_FORMAT)")
 
 cache.lookup:
 	@IMAGE_NAME=$${LOOKUP_IMAGE#*/} ;\
-	if [ -n "$$(docker images -q $(LOOKUP_IMAGE))" ]; then exit 0; fi; \
-	if [ -z "$$(docker images -q $(CACHE_REGISTRY)/$${IMAGE_NAME})" ]; then \
+	if [ -n "$$($(DOCKERCMD) images -q $(LOOKUP_IMAGE))" ]; then exit 0; fi; \
+	if [ -z "$$($(DOCKERCMD) images -q $(CACHE_REGISTRY)/$${IMAGE_NAME})" ]; then \
 		$(MAKE) $(MISS_TARGET); \
 	else \
-		docker tag $$(docker images -q $(CACHE_REGISTRY)/$${IMAGE_NAME}) $(LOOKUP_IMAGE); \
+		$(DOCKERCMD) tag $$($(DOCKERCMD) images -q $(CACHE_REGISTRY)/$${IMAGE_NAME}) $(LOOKUP_IMAGE); \
 	fi;
 
 cache.images:
 	@for i in $(CACHE_IMAGES); do \
-		IMGID=$$(docker images -q $$i); \
+		IMGID=$$($(DOCKERCMD) images -q $$i); \
 		if [ -n "$$IMGID" ]; then \
 			echo === caching image $$i; \
 			CACHE_IMAGE=$(CACHE_REGISTRY)/$${i#*/}; \
-			docker tag $$i $${CACHE_IMAGE}:$(CACHE_TAG); \
-			for r in $$(docker images --format "{{.ID}}#{{.Repository}}:{{.Tag}}" | grep $$IMGID | grep $(CACHE_REGISTRY)/ | grep -v $${CACHE_IMAGE}:$(CACHE_TAG)); do \
-				docker rmi $${r#*#} > /dev/null 2>&1 || true; \
+			$(DOCKERCMD) tag $$i $${CACHE_IMAGE}:$(CACHE_TAG); \
+			for r in $$($(DOCKERCMD) images --format "{{.ID}}#{{.Repository}}:{{.Tag}}" | grep $$IMGID | grep $(CACHE_REGISTRY)/ | grep -v $${CACHE_IMAGE}:$(CACHE_TAG)); do \
+				$(DOCKERCMD) rmi $${r#*#} > /dev/null 2>&1 || true; \
 			done; \
 		fi; \
 	done
@@ -156,31 +154,31 @@ cache.images:
 cache.prune:
 	@echo === pruning images older than $(PRUNE_HOURS) hours
 	@echo === keeping a minimum of $(PRUNE_KEEP) images
-	@EXPIRED=$$(docker images --format "{{.Tag}}#{{.Repository}}:{{.Tag}}" \
+	@EXPIRED=$$($(DOCKERCMD) images --format "{{.Tag}}#{{.Repository}}:{{.Tag}}" \
 		| grep -E '$(CACHE_REGISTRY)/' \
 		| sort -r \
 		| awk -v i=0 -v cd="$(CACHE_PRUNE_DATE)" -F  "#" '{if ($$1 <= cd && i >= $(PRUNE_KEEP)) print $$2; i++ }') &&\
 	for i in $$EXPIRED; do \
 		echo removing expired cache image $$i; \
-		[ $(PRUNE_DRYRUN) = 1 ] || docker rmi $$i > /dev/null 2>&1 || true; \
+		[ $(PRUNE_DRYRUN) = 1 ] || $(DOCKERCMD) rmi $$i > /dev/null 2>&1 || true; \
 	done
-	@for i in $$(docker images -q -f dangling=true); do \
+	@for i in $$($(DOCKERCMD) images -q -f dangling=true); do \
 		echo removing dangling image $$i; \
-		docker rmi $$i > /dev/null 2>&1 || true; \
+		$(DOCKERCMD) rmi $$i > /dev/null 2>&1 || true; \
 	done
 
 # =====================================================================================
 # Debugging nukes all images
 #
 debug.nuke:
-	@for c in $$(docker ps -a -q --no-trunc); do \
+	@for c in $$($(DOCKERCMD) ps -a -q --no-trunc); do \
 		if [ "$$c" != "$(SELF_CID)" ]; then \
 			echo stopping and removing container $${c}; \
-			docker stop $${c}; \
-			docker rm $${c}; \
+			$(DOCKERCMD) stop $${c}; \
+			$(DOCKERCMD) rm $${c}; \
 		fi; \
 	done
-	@for i in $$(docker images -q); do \
+	@for i in $$($(DOCKERCMD) images -q); do \
 		echo removing image $$i; \
-		docker rmi -f $$i > /dev/null 2>&1; \
+		$(DOCKERCMD) rmi -f $$i > /dev/null 2>&1; \
 	done

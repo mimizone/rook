@@ -17,20 +17,12 @@ limitations under the License.
 package integration
 
 import (
-	"regexp"
-	"strings"
 	"testing"
 
 	"github.com/rook/rook/tests/framework/clients"
-	"github.com/rook/rook/tests/framework/contracts"
 	"github.com/rook/rook/tests/framework/installer"
 	"github.com/rook/rook/tests/framework/utils"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
-	"k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/kubernetes/pkg/util/version"
 )
 
 // ************************************************
@@ -68,61 +60,45 @@ func TestSmokeSuite(t *testing.T) {
 type SmokeSuite struct {
 	suite.Suite
 	helper    *clients.TestClient
-	op        contracts.Setup
+	op        *TestCluster
 	k8sh      *utils.K8sHelper
 	namespace string
 }
 
 func (suite *SmokeSuite) SetupSuite() {
 	suite.namespace = "smoke-ns"
-	suite.op, suite.k8sh = NewBaseTestOperations(suite.T, suite.namespace, "bluestore", "", false, false, 3)
-	suite.helper = GetTestClient(suite.k8sh, suite.namespace, suite.op, suite.T)
+	useDevices := true
+	mons := 3
+	rbdMirrorWorkers := 1
+	suite.op, suite.k8sh = StartTestCluster(suite.T, suite.namespace, "bluestore", false, useDevices, mons, rbdMirrorWorkers, installer.VersionMaster, installer.NautilusVersion)
+	suite.helper = clients.CreateTestClient(suite.k8sh, suite.op.installer.Manifests)
 }
 
 func (suite *SmokeSuite) TearDownSuite() {
-	suite.op.TearDown()
+	suite.op.Teardown()
+}
+
+func (suite *SmokeSuite) TestBlockCSI_SmokeTest() {
+	runCephCSIE2ETest(suite.helper, suite.k8sh, suite.Suite, suite.namespace)
 }
 
 func (suite *SmokeSuite) TestBlockStorage_SmokeTest() {
 	runBlockE2ETest(suite.helper, suite.k8sh, suite.Suite, suite.namespace)
 }
+
 func (suite *SmokeSuite) TestFileStorage_SmokeTest() {
 	runFileE2ETest(suite.helper, suite.k8sh, suite.Suite, suite.namespace, "smoke-test-fs")
 }
+
+func (suite *SmokeSuite) TestFileStorageMountUser_SmokeTest() {
+	runFileMountUserE2ETest(suite.helper, suite.k8sh, suite.Suite, suite.namespace, "smoke-test-fs-mountuser")
+}
+
 func (suite *SmokeSuite) TestObjectStorage_SmokeTest() {
 	runObjectE2ETest(suite.helper, suite.k8sh, suite.Suite, suite.namespace)
 }
 
-//Test to make sure all rook components are installed and Running
-func (suite *SmokeSuite) TestRookClusterInstallation_smokeTest() {
+// Test to make sure all rook components are installed and Running
+func (suite *SmokeSuite) TestRookClusterInstallation_SmokeTest() {
 	checkIfRookClusterIsInstalled(suite.Suite, suite.k8sh, installer.SystemNamespace(suite.namespace), suite.namespace, 3)
-}
-
-func (suite *SmokeSuite) TestOperatorGetFlexvolumePath() {
-	v := version.MustParseSemantic(suite.k8sh.GetK8sServerVersion())
-	if !v.LessThan(version.MustParseSemantic("1.9.0")) {
-		suite.T().Skip("Skipping test - known issues with k8s 1.9 (https://github.com/rook/rook/issues/1330)")
-	}
-	// get the operator pod
-	sysNamespace := installer.SystemNamespace(suite.namespace)
-	listOpts := metav1.ListOptions{LabelSelector: "app=rook-operator"}
-	podList, err := suite.k8sh.Clientset.Core().Pods(sysNamespace).List(listOpts)
-	require.Nil(suite.T(), err)
-	require.Equal(suite.T(), 1, len(podList.Items))
-
-	// get the raw log for the operator pod
-	opPodName := podList.Items[0].Name
-	rawLog, err := suite.k8sh.Clientset.Core().Pods(sysNamespace).GetLogs(opPodName, &v1.PodLogOptions{}).Do().Raw()
-	require.Nil(suite.T(), err)
-
-	r := regexp.MustCompile(`discovered flexvolume dir path from source.*\n`)
-	logStmt := string(r.Find(rawLog))
-	logger.Infof("flexvolume discovery log statement: %s", logStmt)
-
-	// verify that the volume plugin dir was discovered by the operator pod and that it did not come from
-	// an env var or the default
-	require.NotEmpty(suite.T(), logStmt)
-	assert.True(suite.T(), strings.Contains(logStmt, "discovered flexvolume dir path from source"))
-	assert.False(suite.T(), strings.Contains(logStmt, "discovered flexvolume dir path from source env var"))
-	assert.False(suite.T(), strings.Contains(logStmt, "discovered flexvolume dir path from source default"))
 }

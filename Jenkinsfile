@@ -2,9 +2,7 @@
 
 pipeline {
    parameters {
-         booleanParam(defaultValue: true, description: 'Execute pipeline?', name: 'shouldBuild')
-         booleanParam(defaultValue: false, description: 'Run Only Smoke Test', name: 'smokeOnly')
-
+         booleanParam(defaultValue: false, description: 'Skip Integration Tests?', name: 'skipIntegrationTests')
       }
     agent { label 'ec2-stateful' }
 
@@ -32,6 +30,9 @@ pipeline {
                     if (body.contains("[smoke only]")) {
                           env.smokeOnly = "true"
                     }
+                    if (body.contains("[all logs]")) {
+                          env.getLogs = "all"
+                    }
                 }
             }
         }
@@ -42,6 +43,7 @@ pipeline {
                 }
             }
             steps {
+                sh 'build/run make -j\$(nproc) vendor.check'
                 sh 'build/run make -j\$(nproc) build.all'
             }
         }
@@ -56,22 +58,42 @@ pipeline {
             }
         }
 
-       stage('Integration Tests') {
+        stage('Publish if Master') {
             when {
                 expression {
-                    return env.shouldBuild != "false" && env.shouldTest != "false"
+                    return env.BRANCH_NAME == "master"
+                }
+            }
+            environment {
+                DOCKER = credentials('rook-docker-hub')
+                AWS = credentials('rook-jenkins-aws')
+                GIT = credentials('rook-github')
+            }
+            steps {
+                sh 'docker login -u="${DOCKER_USR}" -p="${DOCKER_PSW}"'
+                sh 'build/run make -j\$(nproc) -C build/release build BRANCH_NAME=${BRANCH_NAME} GIT_API_TOKEN=${GIT_PSW}'
+                sh 'build/run make -j\$(nproc) -C build/release publish BRANCH_NAME=${BRANCH_NAME} AWS_ACCESS_KEY_ID=${AWS_USR} AWS_SECRET_ACCESS_KEY=${AWS_PSW} GIT_API_TOKEN=${GIT_PSW}'
+                // automatically promote the master builds
+                sh 'build/run make -j\$(nproc) -C build/release promote BRANCH_NAME=master CHANNEL=master AWS_ACCESS_KEY_ID=${AWS_USR} AWS_SECRET_ACCESS_KEY=${AWS_PSW}'
+            }
+        }
+
+        stage('Integration Tests') {
+            when {
+                expression {
+                    return env.shouldBuild != "false" && env.shouldTest != "false" && !params.skipIntegrationTests
                 }
             }
             steps{
                 sh 'cat _output/version | xargs tests/scripts/makeTestImages.sh  save amd64'
-                stash name: 'repo-amd64',includes: 'rook-amd64.tar,build/common.sh,_output/tests/linux_amd64/,_output/charts/,tests/scripts/'
+                stash name: 'repo-amd64',includes: 'ceph-amd64.tar,cockroachdb-amd64.tar,cassandra-amd64.tar,nfs-amd64.tar,build/common.sh,_output/tests/linux_amd64/,_output/charts/,tests/scripts/'
                 script{
                     def data = [
-                        "gce_1.6.1": "v1.6.1",
-                        "gce_1.6.x": "v1.6.13",
-                        "aws_1.7.x": "v1.7.11",
-                        "aws_1.8.x": "v1.8.5",
-                        "gce_1.9.x": "v1.9.1"
+                        "aws_1.10.x": "v1.10.12",
+                        "aws_1.11.x": "v1.11.8",
+                        "aws_1.12.x": "v1.12.6",
+                        "aws_1.13.x": "v1.13.4",
+                        "aws_1.14.x": "v1.14.1"
                     ]
                     testruns = [:]
                     for (kv in mapToList(data)) {
@@ -84,31 +106,29 @@ pipeline {
                     finally{
                         sh "build/run go get -u -f  github.com/jstemmer/go-junit-report"
                         for (kv in mapToList(data)) {
-                            unstash "${kv[0]}_${kv[1]}_result"
-                            sh "cat _output/tests/${kv[0]}_${kv[1]}_integrationTests.log | _output/go-junit-report > _output/tests/${kv[0]}_${kv[1]}_integrationTests.xml"
+                            unstash "${kv[1]}_result"
+                            sh "cat _output/tests/${kv[1]}_integrationTests.log | _output/go-junit-report > _output/tests/${kv[1]}_integrationTests.xml"
                         }
                     }
                 }
             }
         }
-        stage('Publish') {
+
+        stage('Publish if Release') {
             when {
                 expression {
-                    return env.shouldBuild != "false" && env.shouldTest != "false"
+                    return env.BRANCH_NAME.contains("release-")
                 }
             }
             environment {
                 DOCKER = credentials('rook-docker-hub')
-                QUAY = credentials('rook-quay-io')
                 AWS = credentials('rook-jenkins-aws')
                 GIT = credentials('rook-github')
             }
             steps {
                 sh 'docker login -u="${DOCKER_USR}" -p="${DOCKER_PSW}"'
-                sh 'docker login -u="${QUAY_USR}" -p="${QUAY_PSW}" quay.io'
                 sh 'build/run make -j\$(nproc) -C build/release build BRANCH_NAME=${BRANCH_NAME} GIT_API_TOKEN=${GIT_PSW}'
                 sh 'build/run make -j\$(nproc) -C build/release publish BRANCH_NAME=${BRANCH_NAME} AWS_ACCESS_KEY_ID=${AWS_USR} AWS_SECRET_ACCESS_KEY=${AWS_PSW} GIT_API_TOKEN=${GIT_PSW}'
-                sh '[ "${BRANCH_NAME}" != "master" ] || build/run make -j\$(nproc) -C build/release promote BRANCH_NAME=master CHANNEL=master AWS_ACCESS_KEY_ID=${AWS_USR} AWS_SECRET_ACCESS_KEY=${AWS_PSW}'
             }
         }
     }
@@ -143,30 +163,37 @@ def RunIntegrationTest(k, v) {
                             echo "Running Smoke Tests"
                             sh '''#!/bin/bash
                                   set -o pipefail
-                                  export KUBECONFIG=$HOME/admin.conf
+                                  export PATH="/tmp/rook-tests-scripts-helm/linux-amd64:$PATH" \
+                                      KUBECONFIG=$HOME/admin.conf
                                   kubectl config view
-                                  _output/tests/linux_amd64/integration -test.v -test.timeout 600s -test.run SmokeSuite --host_type '''+"${k}"+''' 2>&1 | tee _output/tests/integrationTests.log'''
+                                  _output/tests/linux_amd64/integration -test.v -test.timeout 1800s -test.run SmokeSuite --host_type '''+"${k}"+''' --logs '''+"${env.getLogs}"+''' --helm /tmp/rook-tests-scripts-helm/linux-amd64/helm 2>&1 | tee _output/tests/integrationTests.log'''
                         }
                         else {
                         echo "Running full regression"
                         sh '''#!/bin/bash
                               set -o pipefail
-                              export KUBECONFIG=$HOME/admin.conf
+                              export PATH="/tmp/rook-tests-scripts-helm/linux-amd64:$PATH" \
+                                  KUBECONFIG=$HOME/admin.conf
                               kubectl config view
-                              _output/tests/linux_amd64/integration -test.v -test.timeout 2400s --host_type '''+"${k}"+''' 2>&1 | tee _output/tests/integrationTests.log'''
+                              _output/tests/linux_amd64/integration -test.v -test.timeout 7200s --host_type '''+"${k}"+''' --logs '''+"${env.getLogs}"+''' --helm /tmp/rook-tests-scripts-helm/linux-amd64/helm 2>&1 | tee _output/tests/integrationTests.log'''
                          }
                     }
                     finally{
+                        sh "journalctl -u kubelet > _output/tests/kubelet_${v}.log"
+                        sh "journalctl > _output/tests/system_journalctl_${v}.log"
+                        sh "dmesg > _output/tests/system_dmesg_${v}.log"
                         sh '''#!/bin/bash
                               export KUBECONFIG=$HOME/admin.conf
                               tests/scripts/helm.sh clean || true'''
-                        sh "mv _output/tests/integrationTests.log _output/tests/${k}_${v}_integrationTests.log"
-                        stash name: "${k}_${v}_result",includes : "_output/tests/${k}_${v}_integrationTests.log"
+                        sh "mv _output/tests/integrationTests.log _output/tests/${v}_integrationTests.log"
+                        stash name: "${v}_result",includes : "_output/tests/${v}_integrationTests.log"
                     }
                 }
             }
             finally{
                 archive '_output/tests/*.log'
+                sh 'sudo rm -rf ${PWD}/rook-test'
+                sh 'sudo ls -l ${PWD}'
                 deleteDir()
             }
         }
@@ -200,7 +227,7 @@ def notifySlack(String buildStatus) {
     // Override default values based on build status
     if (buildStatus != 'SUCCESS') {
         // Send notifications to channel on non success builds only
-        if (env.BRANCH_NAME == "master" || env.BRANCH_NAME.contains("release")){
+        if (env.BRANCH_NAME == "master" || env.BRANCH_NAME.contains("release-")){
             slackSend (color: colorCode, message: summary)
         }
     }

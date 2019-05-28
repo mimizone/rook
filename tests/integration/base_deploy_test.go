@@ -23,8 +23,8 @@ import (
 	"testing"
 
 	"github.com/coreos/pkg/capnslog"
+	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	"github.com/rook/rook/tests/framework/clients"
-	"github.com/rook/rook/tests/framework/contracts"
 	"github.com/rook/rook/tests/framework/installer"
 	"github.com/rook/rook/tests/framework/utils"
 	"github.com/stretchr/testify/assert"
@@ -32,19 +32,23 @@ import (
 	"github.com/stretchr/testify/suite"
 )
 
-var (
-	logger = capnslog.NewPackageLogger("github.com/rook/rook", "integrationTest")
-
+const (
 	defaultNamespace = "default"
 )
 
-//Test to make sure all rook components are installed and Running
+var (
+	logger = capnslog.NewPackageLogger("github.com/rook/rook", "integrationTest")
+)
+
+// Test to make sure all rook components are installed and Running
 func checkIfRookClusterIsInstalled(s suite.Suite, k8sh *utils.K8sHelper, opNamespace, clusterNamespace string, mons int) {
 	logger.Infof("Make sure all Pods in Rook Cluster %s are running", clusterNamespace)
-	assert.True(s.T(), k8sh.CheckPodCountAndState("rook-operator", opNamespace, 1, "Running"),
+	assert.True(s.T(), k8sh.CheckPodCountAndState("rook-ceph-operator", opNamespace, 1, "Running"),
 		"Make sure there is 1 rook-operator present in Running state")
-	assert.True(s.T(), k8sh.CheckPodCountAndState("rook-agent", opNamespace, 1, "Running"),
-		"Make sure there is 1 rook-agent present in Running state")
+	assert.True(s.T(), k8sh.CheckPodCountAndState("rook-ceph-agent", opNamespace, 1, "Running"),
+		"Make sure there is 1 rook-ceph-agent present in Running state")
+	assert.True(s.T(), k8sh.CheckPodCountAndState("rook-discover", opNamespace, 1, "Running"),
+		"Make sure there is 1 rook-discover present in Running state")
 	assert.True(s.T(), k8sh.CheckPodCountAndState("rook-ceph-mgr", clusterNamespace, 1, "Running"),
 		"Make sure there is 1 rook-ceph-mgr present in Running state")
 	assert.True(s.T(), k8sh.CheckPodCountAndState("rook-ceph-osd", clusterNamespace, 1, "Running"),
@@ -73,71 +77,69 @@ func checkIfRookClusterIsHealthy(s suite.Suite, testClient *clients.TestClient, 
 	require.Nil(s.T(), err)
 }
 
-func HandlePanics(r interface{}, op contracts.Setup, t func() *testing.T) {
+func HandlePanics(r interface{}, op installer.TestSuite, t func() *testing.T) {
 	if r != nil {
 		logger.Infof("unexpected panic occurred during test %s, --> %v", t().Name(), r)
 		t().Fail()
-		op.TearDown()
+		op.Teardown()
 		t().FailNow()
 	}
-
 }
 
-//GetTestClient sets up SetTestClient for rook
-func GetTestClient(kh *utils.K8sHelper, namespace string, op contracts.Setup, t func() *testing.T) *clients.TestClient {
-	helper, err := clients.CreateTestClient(kh, namespace)
-	if err != nil {
-		logger.Errorf("Cannot create rook test client, er -> %v", err)
-		t().Fail()
-		op.TearDown()
-		t().FailNow()
-	}
-	return helper
+// TestCluster struct for handling panic and test suite tear down
+type TestCluster struct {
+	installer        *installer.CephInstaller
+	kh               *utils.K8sHelper
+	helper           *clients.TestClient
+	T                func() *testing.T
+	namespace        string
+	storeType        string
+	useDevices       bool
+	mons             int
+	rbdMirrorWorkers int
 }
 
-//BaseTestOperations struct for handling panic and test suite tear down
-type BaseTestOperations struct {
-	installer       *installer.InstallHelper
-	kh              *utils.K8sHelper
-	helper          *clients.TestClient
-	T               func() *testing.T
-	namespace       string
-	storeType       string
-	dataDirHostPath string
-	helmInstalled   bool
-	useDevices      bool
-	mons            int
-}
-
-//NewBaseTestOperations creates new instance of BaseTestOperations struct
-func NewBaseTestOperations(t func() *testing.T, namespace, storeType, dataDirHostPath string, helmInstalled, useDevices bool, mons int) (BaseTestOperations, *utils.K8sHelper) {
+// StartTestCluster creates new instance of TestCluster struct
+func StartTestCluster(t func() *testing.T, namespace, storeType string, useHelm, useDevices bool, mons, rbdMirrorWorkers int, rookVersion string, cephVersion cephv1.CephVersionSpec) (*TestCluster, *utils.K8sHelper) {
 	kh, err := utils.CreateK8sHelper(t)
 	require.NoError(t(), err)
 
-	i := installer.NewK8sRookhelper(kh.Clientset, t)
+	i := installer.NewCephInstaller(t, kh.Clientset, useHelm, rookVersion, cephVersion)
 
-	op := BaseTestOperations{i, kh, nil, t, namespace, storeType, dataDirHostPath, helmInstalled, useDevices, mons}
-	op.SetUp()
+	op := &TestCluster{i, kh, nil, t, namespace, storeType, useDevices, mons, rbdMirrorWorkers}
+
+	if rookVersion != installer.VersionMaster {
+		// make sure we have the images from a previous release locally so the test doesn't hit a timeout
+		assert.NoError(t(), kh.GetDockerImage("rook/ceph:"+rookVersion))
+	}
+
+	assert.NoError(t(), kh.GetDockerImage(cephVersion.Image))
+
+	op.Setup()
 	return op, kh
 }
 
-//SetUpRook is a wrapper for setting up rook
-func (op BaseTestOperations) SetUp() {
+// SetUpRook is a wrapper for setting up rook
+func (op *TestCluster) Setup() {
 	isRookInstalled, err := op.installer.InstallRookOnK8sWithHostPathAndDevices(op.namespace, op.storeType,
-		op.dataDirHostPath, op.helmInstalled, op.useDevices, op.mons, false /* startWithAllNodes */)
-	assert.NoError(op.T(), err)
-	if !isRookInstalled {
-		logger.Errorf("Rook was not installed successfully")
+		op.useDevices, cephv1.MonSpec{Count: op.mons, AllowMultiplePerNode: true}, false /* startWithAllNodes */, op.rbdMirrorWorkers)
+
+	if !isRookInstalled || err != nil {
+		logger.Errorf("Rook was not installed successfully: %v", err)
+		if !op.installer.T().Failed() {
+			op.installer.GatherAllRookLogs(op.namespace, installer.SystemNamespace(op.namespace), op.installer.T().Name())
+		}
 		op.T().Fail()
-		op.TearDown()
+		op.Teardown()
 		op.T().FailNow()
 	}
 }
 
-//TearDownRook is a wrapper for tearDown after Sutie
-func (op BaseTestOperations) TearDown() {
-	if op.installer.T().Failed() {
-		op.installer.GatherAllRookLogs(op.namespace, op.installer.T().Name())
-	}
-	op.installer.UninstallRook(op.helmInstalled, op.namespace)
+// SetInstallData updates the installer helper based on the version of Rook desired
+func (op *TestCluster) SetInstallData(version string) {}
+
+// TearDownRook is a wrapper for tearDown after Suite
+func (op *TestCluster) Teardown() {
+	op.installer.GatherAllRookLogs(op.namespace, installer.SystemNamespace(op.namespace), op.installer.T().Name())
+	op.installer.UninstallRook(op.namespace)
 }

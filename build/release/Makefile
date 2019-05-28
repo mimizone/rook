@@ -21,7 +21,7 @@ include ../makelib/helm.mk
 # Options
 
 CHANNEL ?= master
-ifeq ($(filter master alpha beta stable,$(CHANNEL)),)
+ifeq ($(filter master release,$(CHANNEL)),)
 $(error invalid channel $(CHANNEL))
 endif
 
@@ -56,9 +56,7 @@ override BRANCH_NAME := pr/$(BRANCH_NAME)
 endif
 
 DOCKER_REGISTRY ?= rook
-QUAY_REGISTRY ?= quay.io/rook
-REGISTRIES ?= $(DOCKER_REGISTRY) $(QUAY_REGISTRY)
-IMAGES ?= rook toolbox
+REGISTRIES ?= $(DOCKER_REGISTRY)
 IMAGE_ARCHS := $(subst linux_,,$(filter linux_%,$(PLATFORMS)))
 IMAGE_PLATFORMS := $(subst _,/,$(subst $(SPACE),$(COMMA),$(filter linux_%,$(PLATFORMS))))
 
@@ -121,10 +119,10 @@ build.docs:
 	git clone --depth=1 -b master $(DOCS_GIT_REPO) $(DOCS_WORK_DIR)
 	rm -rf $(DOCS_VERSION_DIR)
 	cp -r $(DOCS_DIR)/ $(DOCS_VERSION_DIR)
-	cd $(DOCS_WORK_DIR) && npm install && node build/scripts/preprocess.js
+	cd $(DOCS_WORK_DIR) && DOCS_VERSION=$(DOCS_VERSION) $(MAKE) _data/projects.json
 
 publish.docs:
-	$(DOCS_WORK_DIR)/build/publish.sh
+	cd $(DOCS_WORK_DIR) && DOCS_VERSION=$(DOCS_VERSION) $(MAKE) publish
 
 # ====================================================================================
 # helm
@@ -133,7 +131,7 @@ HELM_TEMP := $(shell mktemp -d)
 HELM_URL := $(HELM_BASE_URL)/$(CHANNEL)
 
 promote.helm: $(HELM)
-#	copy existing charts to a temp dir, the combine with new charts, reindex, and upload
+#	copy existing charts to a temp dir, then combine with new charts, reindex, and upload
 	@$(S3_SYNC) s3://$(HELM_S3_BUCKET)/$(CHANNEL) $(HELM_TEMP)
 	@$(S3_SYNC) s3://$(S3_BUCKET)/build/$(BRANCH_NAME)/$(VERSION)/charts $(HELM_TEMP)
 	@$(HELM) repo index --url $(HELM_URL) $(HELM_TEMP)
@@ -154,7 +152,11 @@ promote.output:
 
 # 1: registry 2: image, 3: arch
 define repo.targets
-build.image.$(1).$(2).$(3): ; @docker tag $(BUILD_REGISTRY)/$(2)-$(3) $(1)/$(2)-$(3):$(VERSION)
+build.image.$(1).$(2).$(3):
+	@docker tag $(BUILD_REGISTRY)/$(2)-$(3) $(1)/$(2)-$(3):$(VERSION)
+	@# Save image as _output/images/linux_<arch>/<image>.tar.gz (no builds for darwin or windows)
+	@mkdir -p $(OUTPUT_DIR)/images/linux_$(3)
+	@docker save $(BUILD_REGISTRY)/$(2)-$(3) | gzip -c > $(OUTPUT_DIR)/images/linux_$(3)/$(2).tar.gz
 build.all.images: build.image.$(1).$(2).$(3)
 publish.image.$(1).$(2).$(3): ; @docker push $(1)/$(2)-$(3):$(VERSION)
 publish.all.images: publish.image.$(1).$(2).$(3)
@@ -203,7 +205,7 @@ help:
 	@echo '    VERSION      Sets the release version.'
 	@echo '    BRANCH_NAME  Name of the branch we're releasing from.'
 	@echo '    CHANNEL      Sets the release channel. Can be set to master,'
-	@echo '                 alpha, beta, or stable. Default is not set.'
+	@echo '                 or release. Default is not set.'
 	@echo '    PLATFORMS    The supported platforms to build when running.'
 	@echo '                 the build.all target. The default is'
 	@echo '                 all supported platforms'

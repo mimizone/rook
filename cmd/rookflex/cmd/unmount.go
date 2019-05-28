@@ -19,12 +19,11 @@ package cmd
 import (
 	"fmt"
 	"net/rpc"
+	"os/exec"
 
-	"github.com/rook/rook/pkg/daemon/agent/flexvolume"
-	"github.com/rook/rook/pkg/util/exec"
+	"github.com/rook/rook/pkg/daemon/ceph/agent/flexvolume"
 	"github.com/spf13/cobra"
 	k8smount "k8s.io/kubernetes/pkg/util/mount"
-	"k8s.io/kubernetes/pkg/volume/util"
 )
 
 var (
@@ -33,7 +32,6 @@ var (
 		Short: "Unmounts the pod volume",
 		RunE:  handleUnmount,
 	}
-	executor = &exec.CommandExecutor{}
 )
 
 func init() {
@@ -53,7 +51,8 @@ func handleUnmount(cmd *cobra.Command, args []string) error {
 	mounter := getMounter()
 
 	// Check if it's a cephfs
-	err = executor.ExecuteCommand(false, "", "df", "--type", cephFS, mountDir)
+	command := exec.Command("df", "--type", cephFS, mountDir)
+	err = command.Run()
 	if err == nil {
 		return unmountCephFS(client, mounter, mountDir)
 	}
@@ -68,10 +67,20 @@ func handleUnmount(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("Unmount volume at mount dir %s failed: %v", opts.MountDir, err)
 	}
 
-	var globalVolumeMountPath string
-	err = client.Call("Controller.GetGlobalMountPath", opts.VolumeName, &globalVolumeMountPath)
+	// construct the input we'll need to get the global mount path
+	driverDir, err := getDriverDir()
 	if err != nil {
-		log(client, fmt.Sprintf("Detach volume %s/%s failed. Cannot get global volume mount path: %v", opts.Pool, opts.Image, err), true)
+		return err
+	}
+	globalMountPathInput := flexvolume.GlobalMountPathInput{
+		VolumeName: opts.VolumeName,
+		DriverDir:  driverDir,
+	}
+
+	var globalVolumeMountPath string
+	err = client.Call("Controller.GetGlobalMountPath", globalMountPathInput, &globalVolumeMountPath)
+	if err != nil {
+		log(client, fmt.Sprintf("Detach volume %s/%s failed. Cannot get global volume mount path: %v", opts.BlockPool, opts.Image, err), true)
 		return fmt.Errorf("Rook: Unmount volume failed. Cannot get global volume mount path: %v", err)
 	}
 
@@ -81,7 +90,7 @@ func handleUnmount(cmd *cobra.Command, args []string) error {
 		func() error {
 
 			// Unmount pod mount dir
-			if err := util.UnmountPath(opts.MountDir, mounter.Interface); err != nil {
+			if err := k8smount.CleanupMountPoint(opts.MountDir, mounter.Interface, false); err != nil {
 				return fmt.Errorf("failed to unmount volume at %s: %+v", opts.MountDir, err)
 			}
 
@@ -95,7 +104,7 @@ func handleUnmount(cmd *cobra.Command, args []string) error {
 			// If safeToDetach is true, then all attachment on this node has been removed
 			// Unmount global mount dir
 			if safeToDetach {
-				if err := util.UnmountPath(globalVolumeMountPath, mounter.Interface); err != nil {
+				if err := k8smount.CleanupMountPoint(globalVolumeMountPath, mounter.Interface, false); err != nil {
 					return fmt.Errorf("failed to unmount volume at %s: %+v", opts.MountDir, err)
 				}
 			}
@@ -128,7 +137,7 @@ func unmountCephFS(client *rpc.Client, mounter *k8smount.SafeFormatAndMount, mou
 		client,
 		func() error {
 			// Unmount pod mount dir
-			if err := util.UnmountPath(mountDir, mounter.Interface); err != nil {
+			if err := k8smount.CleanupMountPoint(mountDir, mounter.Interface, false); err != nil {
 				return fmt.Errorf("failed to unmount cephfs volume at %s: %+v", mountDir, err)
 			}
 			return nil

@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package test for the operator tests.
 package test
 
 import (
@@ -29,7 +28,7 @@ import (
 func New(nodes int) *fake.Clientset {
 	clientset := fake.NewSimpleClientset()
 	for i := 0; i < nodes; i++ {
-		ready := v1.NodeCondition{Type: v1.NodeReady}
+		ready := v1.NodeCondition{Type: v1.NodeReady, Status: v1.ConditionTrue}
 		name := fmt.Sprintf("node%d", i)
 		n := &v1.Node{
 			ObjectMeta: metav1.ObjectMeta{

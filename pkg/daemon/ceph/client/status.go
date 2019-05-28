@@ -35,7 +35,9 @@ const (
 )
 
 const (
-	clusterStateActiveClean = "active+clean"
+	activeClean              = "active+clean"
+	activeCleanScrubbing     = "active+clean+scrubbing"
+	activeCleanScrubbingDeep = "active+clean+scrubbing+deep"
 )
 
 type CephStatus struct {
@@ -121,9 +123,11 @@ type PgStateEntry struct {
 	Count     int    `json:"count"`
 }
 
-func Status(context *clusterd.Context, clusterName string) (CephStatus, error) {
+func Status(context *clusterd.Context, clusterName string, debug bool) (CephStatus, error) {
 	args := []string{"status"}
-	buf, err := ExecuteCephCommand(context, clusterName, args)
+	cmd := NewCephCommand(context, clusterName, args)
+	cmd.Debug = debug
+	buf, err := cmd.Run()
 	if err != nil {
 		return CephStatus{}, fmt.Errorf("failed to get status: %+v", err)
 	}
@@ -139,22 +143,30 @@ func Status(context *clusterd.Context, clusterName string) (CephStatus, error) {
 // IsClusterClean returns a value indicating if the cluster is fully clean yet (i.e., all placement
 // groups are in the active+clean state).
 func IsClusterClean(context *clusterd.Context, clusterName string) error {
-	status, err := Status(context, clusterName)
+	status, err := Status(context, clusterName, false)
 	if err != nil {
 		return err
 	}
 
+	return isClusterClean(status)
+}
+
+func isClusterClean(status CephStatus) error {
 	if status.PgMap.NumPgs == 0 {
 		// there are no PGs yet, that still counts as clean
 		return nil
 	}
 
+	cleanPGs := 0
 	for _, pg := range status.PgMap.PgsByState {
-		if pg.StateName == clusterStateActiveClean && pg.Count == status.PgMap.NumPgs {
-			// all PGs in the cluster are in active+clean state, cluster is clean.
-			logger.Infof("all placement groups have reached the %s state: %+v", clusterStateActiveClean, status.PgMap.PgsByState)
-			return nil
+		if pg.StateName == activeClean || pg.StateName == activeCleanScrubbing || pg.StateName == activeCleanScrubbingDeep {
+			cleanPGs += pg.Count
 		}
+	}
+	if cleanPGs == status.PgMap.NumPgs {
+		// all PGs in the cluster are in a clean state
+		logger.Infof("all placement groups have reached a clean state: %+v", status.PgMap.PgsByState)
+		return nil
 	}
 
 	return fmt.Errorf("cluster is not fully clean. PGs: %+v", status.PgMap.PgsByState)

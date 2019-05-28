@@ -20,6 +20,7 @@ import (
 	"fmt"
 
 	"github.com/rook/rook/pkg/daemon/ceph/client"
+	"github.com/rook/rook/tests/framework/installer"
 	"github.com/rook/rook/tests/framework/utils"
 )
 
@@ -27,35 +28,38 @@ var (
 	versionCmd = []string{"rook", "version"}
 )
 
-//TestClient is a wrapper for test client, containing interfaces for all rook operations
+// TestClient is a wrapper for test client, containing interfaces for all rook operations
 type TestClient struct {
-	BlockClient  *BlockOperation
-	FSClient     *FilesystemOperation
-	ObjectClient *ObjectOperation
-	PoolClient   *PoolOperation
-	k8sh         *utils.K8sHelper
+	BlockClient      *BlockOperation
+	FSClient         *FilesystemOperation
+	NFSClient        *NFSOperation
+	ObjectClient     *ObjectOperation
+	ObjectUserClient *ObjectUserOperation
+	PoolClient       *PoolOperation
+	k8sh             *utils.K8sHelper
 }
 
 const (
 	unableToCheckRookStatusMsg = "Unable to check rook status - please check of rook is up and running"
 )
 
-//CreateTestClient creates new instance of test client for a platform
-func CreateTestClient(k8sHelper *utils.K8sHelper, namespace string) (*TestClient, error) {
-
+// CreateTestClient creates new instance of test client for a platform
+func CreateTestClient(k8sHelper *utils.K8sHelper, manifests installer.CephManifests) *TestClient {
 	return &TestClient{
-		CreateK8BlockOperation(k8sHelper),
-		CreateK8sFilesystemOperation(k8sHelper),
-		CreateObjectOperation(k8sHelper),
-		CreatePoolOperation(k8sHelper),
+		CreateBlockOperation(k8sHelper, manifests),
+		CreateFilesystemOperation(k8sHelper, manifests),
+		CreateNFSOperation(k8sHelper, manifests),
+		CreateObjectOperation(k8sHelper, manifests),
+		CreateObjectUserOperation(k8sHelper, manifests),
+		CreatePoolOperation(k8sHelper, manifests),
 		k8sHelper,
-	}, nil
+	}
 }
 
-//Status returns rook status details
+// Status returns rook status details
 func (c TestClient) Status(namespace string) (client.CephStatus, error) {
 	context := c.k8sh.MakeContext()
-	status, err := client.Status(context, namespace)
+	status, err := client.Status(context, namespace, false)
 	if err != nil {
 		return client.CephStatus{}, fmt.Errorf("failed to get status: %+v", err)
 	}

@@ -22,10 +22,8 @@ import (
 	"testing"
 
 	"github.com/rook/rook/tests/framework/clients"
-	"github.com/rook/rook/tests/framework/contracts"
 	"github.com/rook/rook/tests/framework/installer"
 	"github.com/rook/rook/tests/framework/utils"
-	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -35,8 +33,8 @@ import (
 // Create object store bucket and perform CURD operations.
 // This Test creates 1 to n object stores - first object store is present throughout the run,
 // but all other object stores are deleted after each run.
-//NOTE: This tests doesn't clean up the cluster or volume after the run, the tests is designed
-//to reuse the same cluster and volume for multiple runs or over a period of time.
+// NOTE: This tests doesn't clean up the cluster or volume after the run, the tests is designed
+// to reuse the same cluster and volume for multiple runs or over a period of time.
 // It is recommended to run this test with -count test param (to repeat th test n number of times)
 // along with --load_parallel_runs params(number of concurrent operations per test) and
 //--load_volumes(number of volumes that are created per test
@@ -47,25 +45,23 @@ func TestObjectLongHaul(t *testing.T) {
 type ObjectLongHaulSuite struct {
 	suite.Suite
 	kh        *utils.K8sHelper
-	installer *installer.InstallHelper
+	installer *installer.CephInstaller
 	tc        *clients.TestClient
 	namespace string
-	op        contracts.Setup
+	op        installer.TestSuite
 }
 
 func (s *ObjectLongHaulSuite) SetupSuite() {
-	var err error
 	s.namespace = "longhaul-ns"
-	s.op, s.kh, s.installer = NewBaseLoadTestOperations(s.T, s.namespace)
-	s.tc, err = clients.CreateTestClient(s.kh, s.namespace)
-	require.Nil(s.T(), err)
+	s.op, s.kh, s.installer = StartLoadTestCluster(s.T, s.namespace)
+	s.tc = clients.CreateTestClient(s.kh, s.installer.Manifests)
 }
 
 func (s *ObjectLongHaulSuite) TestObjectLonghaulRun() {
 	var wg sync.WaitGroup
 	storeName := "longhaulstore"
-	wg.Add(s.installer.Env.LoadVolumeNumber)
-	for i := 1; i <= s.installer.Env.LoadVolumeNumber; i++ {
+	wg.Add(installer.Env.LoadVolumeNumber)
+	for i := 1; i <= installer.Env.LoadVolumeNumber; i++ {
 		if i == 1 {
 			go ObjectStoreOperations(s, &wg, s.namespace, storeName+strconv.Itoa(i), false)
 		} else {
@@ -90,10 +86,10 @@ func ObjectStoreOperations(s *ObjectLongHaulSuite, wg *sync.WaitGroup, namespace
 		s.T().Fail()
 	}
 
-	performObjectStoreOperations(s.installer, s3, bucketName)
+	performObjectStoreOperations(s3, bucketName)
 	if deleteStore {
 		delOpts := metav1.DeleteOptions{}
-		s.tc.ObjectClient.Delete(namespace, storeName, 3)
+		s.tc.ObjectClient.Delete(namespace, storeName)
 		s.kh.Clientset.CoreV1().Services(namespace).Delete("rgw-external-"+storeName, &delOpts)
 	}
 	s3 = nil

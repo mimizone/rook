@@ -17,9 +17,10 @@ limitations under the License.
 package cmd
 
 import (
-	"fmt"
 	"os"
+	"path/filepath"
 
+	"github.com/rook/rook/pkg/daemon/ceph/agent/flexvolume"
 	"github.com/spf13/cobra"
 )
 
@@ -36,7 +37,14 @@ func init() {
 }
 
 func initPlugin(cmd *cobra.Command, args []string) error {
-	fmt.Println(`{"status":"Success", "capabilities": {"attach": false}}`)
+	executable, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	settings := flexvolume.LoadFlexSettings(filepath.Dir(executable))
+	if _, err := os.Stdout.WriteString(string(settings)); err != nil {
+		return err
+	}
 	os.Exit(0)
 	return nil
 }

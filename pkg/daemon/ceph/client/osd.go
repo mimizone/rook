@@ -93,7 +93,7 @@ func (dump *OSDDump) StatusByID(id int64) (int64, int64, error) {
 
 func GetOSDUsage(context *clusterd.Context, clusterName string) (*OSDUsage, error) {
 	args := []string{"osd", "df"}
-	buf, err := ExecuteCephCommand(context, clusterName, args)
+	buf, err := NewCephCommand(context, clusterName, args).Run()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get osd df: %+v", err)
 	}
@@ -108,7 +108,7 @@ func GetOSDUsage(context *clusterd.Context, clusterName string) (*OSDUsage, erro
 
 func GetOSDPerfStats(context *clusterd.Context, clusterName string) (*OSDPerfStats, error) {
 	args := []string{"osd", "perf"}
-	buf, err := ExecuteCephCommand(context, clusterName, args)
+	buf, err := NewCephCommand(context, clusterName, args).Run()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get osd perf: %+v", err)
 	}
@@ -123,7 +123,9 @@ func GetOSDPerfStats(context *clusterd.Context, clusterName string) (*OSDPerfSta
 
 func GetOSDDump(context *clusterd.Context, clusterName string) (*OSDDump, error) {
 	args := []string{"osd", "dump"}
-	buf, err := ExecuteCephCommand(context, clusterName, args)
+	cmd := NewCephCommand(context, clusterName, args)
+	cmd.Debug = true
+	buf, err := cmd.Run()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get osd dump: %+v", err)
 	}
@@ -138,46 +140,14 @@ func GetOSDDump(context *clusterd.Context, clusterName string) (*OSDDump, error)
 
 func OSDOut(context *clusterd.Context, clusterName string, osdID int) (string, error) {
 	args := []string{"osd", "out", strconv.Itoa(osdID)}
-	buf, err := ExecuteCephCommand(context, clusterName, args)
+	buf, err := NewCephCommand(context, clusterName, args).Run()
 	return string(buf), err
 }
 
 func OSDRemove(context *clusterd.Context, clusterName string, osdID int) (string, error) {
 	args := []string{"osd", "rm", strconv.Itoa(osdID)}
-	buf, err := ExecuteCephCommand(context, clusterName, args)
+	buf, err := NewCephCommand(context, clusterName, args).Run()
 	return string(buf), err
-}
-
-func DisableScrubbing(context *clusterd.Context, clusterName string) (string, error) {
-	args := []string{"osd", "set", "noscrub"}
-	buf, err := ExecuteCephCommand(context, clusterName, args)
-	if err != nil {
-		return string(buf), fmt.Errorf("failed to set noscrub: %+v", err)
-	}
-
-	args = []string{"osd", "set", "nodeep-scrub"}
-	buf, err = ExecuteCephCommand(context, clusterName, args)
-	if err != nil {
-		return string(buf), fmt.Errorf("failed to set nodeep-scrub: %+v", err)
-	}
-
-	return string(buf), nil
-}
-
-func EnableScrubbing(context *clusterd.Context, clusterName string) (string, error) {
-	args := []string{"osd", "unset", "noscrub"}
-	buf, err := ExecuteCephCommand(context, clusterName, args)
-	if err != nil {
-		return string(buf), fmt.Errorf("failed to unset noscrub: %+v", err)
-	}
-
-	args = []string{"osd", "unset", "nodeep-scrub"}
-	buf, err = ExecuteCephCommand(context, clusterName, args)
-	if err != nil {
-		return string(buf), fmt.Errorf("failed to unset nodeep-scrub: %+v", err)
-	}
-
-	return string(buf), nil
 }
 
 func (usage *OSDUsage) ByID(osdID int) *OSDNodeUsage {

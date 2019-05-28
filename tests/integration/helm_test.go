@@ -20,7 +20,7 @@ import (
 
 	"github.com/coreos/pkg/capnslog"
 	"github.com/rook/rook/tests/framework/clients"
-	"github.com/rook/rook/tests/framework/contracts"
+	"github.com/rook/rook/tests/framework/installer"
 	"github.com/rook/rook/tests/framework/utils"
 	"github.com/stretchr/testify/suite"
 )
@@ -57,37 +57,40 @@ type HelmSuite struct {
 	suite.Suite
 	helper    *clients.TestClient
 	kh        *utils.K8sHelper
-	op        contracts.Setup
+	op        *TestCluster
 	namespace string
 }
 
 func (hs *HelmSuite) SetupSuite() {
 	hs.namespace = "helm-ns"
-	hs.op, hs.kh = NewBaseTestOperations(hs.T, hs.namespace, "bluestore", "", true, false, 3)
-	hs.helper = GetTestClient(hs.kh, hs.namespace, hs.op, hs.T)
-
+	mons := 1
+	rbdMirrorWorkers := 1
+	hs.op, hs.kh = StartTestCluster(hs.T, hs.namespace, "bluestore", true, false, mons, rbdMirrorWorkers, installer.VersionMaster, installer.MimicVersion)
+	hs.helper = clients.CreateTestClient(hs.kh, hs.op.installer.Manifests)
 }
 
 func (hs *HelmSuite) TearDownSuite() {
-	hs.op.TearDown()
+	hs.op.Teardown()
 }
 
-//Test to make sure all rook components are installed and Running
+// Test to make sure all rook components are installed and Running
 func (hs *HelmSuite) TestRookInstallViaHelm() {
 	checkIfRookClusterIsInstalled(hs.Suite, hs.kh, hs.namespace, hs.namespace, 1)
 }
 
-//Test BlockCreation on Rook that was installed via Helm
+// Test BlockCreation on Rook that was installed via Helm
 func (hs *HelmSuite) TestBlockStoreOnRookInstalledViaHelm() {
-	runBlockE2ETestLite(hs.helper, hs.kh, hs.Suite, hs.namespace)
+	runBlockE2ETestLite(hs.helper, hs.kh, hs.Suite, hs.namespace, hs.op.installer.CephVersion)
 }
 
-//Test File System Creation on Rook that was installed via helm
-func (hs *HelmSuite) TestFileStoreOnRookInstalledViaHelm() {
+// Test File System Creation on Rook that was installed via helm
+// The test func name has `Z` in its name to run as the last test, this needs to
+// be done as there were some issues that the operator "disappeared".
+func (hs *HelmSuite) TestZFileStoreOnRookInstalledViaHelm() {
 	runFileE2ETestLite(hs.helper, hs.kh, hs.Suite, hs.namespace, "testfs")
 }
 
-//Test Object StoreCreation on Rook that was installed via helm
+// Test Object StoreCreation on Rook that was installed via helm
 func (hs *HelmSuite) TestObjectStoreOnRookInstalledViaHelm() {
 	runObjectE2ETestLite(hs.helper, hs.kh, hs.Suite, hs.namespace, "default", 3)
 }

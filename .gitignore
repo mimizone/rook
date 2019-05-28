@@ -6,3 +6,8 @@
 /_output
 /vendor/
 /vendor.orig/
+
+/tests/integration/rook-test/
+
+# OLM related stuff
+cluster/olm/ceph/deploy/*

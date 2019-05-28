@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
 package osd
 
 import (
@@ -26,14 +27,14 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
-	rookalpha "github.com/rook/rook/pkg/apis/rook.io/v1alpha1"
 	"github.com/rook/rook/pkg/clusterd"
-	"github.com/rook/rook/pkg/daemon/ceph/mon"
+	cephconfig "github.com/rook/rook/pkg/daemon/ceph/config"
 	"github.com/rook/rook/pkg/daemon/ceph/test"
-	"github.com/rook/rook/pkg/operator/cluster/ceph/osd/config"
+	"github.com/rook/rook/pkg/operator/ceph/cluster/osd/config"
 	"github.com/rook/rook/pkg/operator/k8sutil"
 	testop "github.com/rook/rook/pkg/operator/test"
 	exectest "github.com/rook/rook/pkg/util/exec/test"
+	"github.com/rook/rook/pkg/util/sys"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -41,7 +42,7 @@ import (
 
 func TestStoreTypeDefaults(t *testing.T) {
 	// A filestore dir
-	cfg := &osdConfig{dir: true, storeConfig: rookalpha.StoreConfig{StoreType: ""}}
+	cfg := &osdConfig{dir: true, storeConfig: config.StoreConfig{StoreType: ""}}
 	assert.True(t, isFilestore(cfg))
 	assert.False(t, isFilestoreDevice(cfg))
 	assert.True(t, isFilestoreDir(cfg))
@@ -50,7 +51,7 @@ func TestStoreTypeDefaults(t *testing.T) {
 	assert.False(t, isBluestoreDir(cfg))
 
 	// A bluestore dir
-	cfg = &osdConfig{dir: true, storeConfig: rookalpha.StoreConfig{StoreType: "bluestore"}}
+	cfg = &osdConfig{dir: true, storeConfig: config.StoreConfig{StoreType: "bluestore"}}
 	assert.False(t, isFilestore(cfg))
 	assert.False(t, isFilestoreDevice(cfg))
 	assert.False(t, isFilestoreDir(cfg))
@@ -77,21 +78,30 @@ func TestStoreTypeDefaults(t *testing.T) {
 	assert.False(t, isBluestoreDir(cfg))
 }
 
-func TestOSDAgentWithDevicesFilestore(t *testing.T) {
-	testOSDAgentWithDevicesHelper(t, rookalpha.StoreConfig{StoreType: config.Filestore})
+func TestOSDAgentLegacyFilestore(t *testing.T) {
+	testOSDAgentWithDevicesHelper(t, config.StoreConfig{StoreType: config.Filestore}, true)
 }
 
-func TestOSDAgentWithDevicesBluestore(t *testing.T) {
-	testOSDAgentWithDevicesHelper(t, rookalpha.StoreConfig{StoreType: config.Bluestore})
+func TestOSDAgentLegacyBluestore(t *testing.T) {
+	testOSDAgentWithDevicesHelper(t, config.StoreConfig{StoreType: config.Bluestore}, true)
 }
 
-func testOSDAgentWithDevicesHelper(t *testing.T, storeConfig rookalpha.StoreConfig) {
+func TestOSDAgenCephVolumeBluestore(t *testing.T) {
+	testOSDAgentWithDevicesHelper(t, config.StoreConfig{StoreType: config.Bluestore}, false)
+}
+
+func TestOSDAgenCephVolumeFilestore(t *testing.T) {
+	testOSDAgentWithDevicesHelper(t, config.StoreConfig{StoreType: config.Filestore}, false)
+}
+
+func testOSDAgentWithDevicesHelper(t *testing.T, storeConfig config.StoreConfig, legacyProvisioner bool) {
 	// set up a temporary config directory that will be cleaned up after test
 	configDir, err := ioutil.TempDir("", "")
 	if err != nil {
 		t.Fatalf("failed to create temp config dir: %+v", err)
 	}
 	defer os.RemoveAll(configDir)
+	cephConfigDir = configDir
 
 	agent, executor, _ := createTestAgent(t, "sdx,sdy", configDir, "node1891", &storeConfig)
 
@@ -101,8 +111,6 @@ func testOSDAgentWithDevicesHelper(t *testing.T, storeConfig rookalpha.StoreConf
 		cmd := &exec.Cmd{Args: append([]string{command}, args...)}
 
 		switch {
-		case startCount < 2:
-			assert.Equal(t, "ceph-osd", command)
 		default:
 			assert.Fail(t, fmt.Sprintf("unexpected case %d", startCount))
 		}
@@ -112,14 +120,14 @@ func testOSDAgentWithDevicesHelper(t *testing.T, storeConfig rookalpha.StoreConf
 
 	execCount := 0
 	executor.MockExecuteCommand = func(debug bool, name string, command string, args ...string) error {
-		logger.Infof("RUN %d: %s %+v", execCount, command, args)
+		logger.Infof("EXEC %d: %s %+v", execCount, command, args)
 		parts := strings.Split(name, " ")
 		nameSuffix := parts[0]
 		if len(parts) > 1 {
 			nameSuffix = parts[1]
 		}
 
-		if storeConfig.StoreType == config.Bluestore {
+		if storeConfig.StoreType == config.Bluestore && legacyProvisioner {
 			switch {
 			case execCount == 0: // first exec is the osd mkfs for sdx
 				assert.Equal(t, "--mkfs", args[0])
@@ -143,7 +151,7 @@ func testOSDAgentWithDevicesHelper(t *testing.T, storeConfig rookalpha.StoreConf
 			default:
 				assert.Fail(t, fmt.Sprintf("unexpected case %d", execCount))
 			}
-		} else if storeConfig.StoreType == config.Filestore {
+		} else if storeConfig.StoreType == config.Filestore && legacyProvisioner {
 			switch {
 			case execCount == 0:
 				// first exec is the remounting of sdx because its partitions were created previously, we just need to remount it
@@ -153,28 +161,32 @@ func testOSDAgentWithDevicesHelper(t *testing.T, storeConfig rookalpha.StoreConf
 				// the osd mkfs for sdx
 				assert.Equal(t, "--mkfs", args[0])
 				createTestKeyring(t, configDir, args)
-			case execCount == 2: // all remaining execs are for partitioning sdy then mkfs sdy
+			case execCount == 2:
+				assert.Equal(t, "umount", command)
+			case execCount == 3: // all remaining execs are for partitioning sdy then mkfs sdy
 				assert.Equal(t, "sgdisk", command)
 				assert.Equal(t, "--zap-all", args[0])
 				assert.Equal(t, "/dev/"+nameSuffix, args[1])
-			case execCount == 3:
+			case execCount == 4:
 				assert.Equal(t, "sgdisk", command)
 				assert.Equal(t, "--clear", args[0])
 				assert.Equal(t, "/dev/"+nameSuffix, args[2])
-			case execCount == 4:
+			case execCount == 5:
 				// the partitioning for sdy.
 				assert.Equal(t, "sgdisk", command)
 				assert.Equal(t, "/dev/"+nameSuffix, args[4])
-			case execCount == 5:
+			case execCount == 6:
 				// mkfs.ext4 for sdy filestore
 				assert.Equal(t, "mkfs.ext4", command)
-			case execCount == 6:
+			case execCount == 7:
 				// the mount for sdy filestore
 				assert.Equal(t, "mount", command)
-			case execCount == 7:
+			case execCount == 8:
 				// the osd mkfs for sdy filestore
 				assert.Equal(t, "--mkfs", args[0])
 				createTestKeyring(t, configDir, args)
+			case execCount == 9:
+				assert.Equal(t, "umount", command)
 			default:
 				assert.Fail(t, fmt.Sprintf("unexpected case %d", execCount))
 			}
@@ -186,7 +198,7 @@ func testOSDAgentWithDevicesHelper(t *testing.T, storeConfig rookalpha.StoreConf
 
 	outputExecCount := 0
 	executor.MockExecuteCommandWithOutputFile = func(debug bool, actionName string, command string, outFileArg string, args ...string) (string, error) {
-		logger.Infof("OUTPUT %d for %s. %s %+v", outputExecCount, actionName, command, args)
+		logger.Infof("OUTPUT %d. %s %+v", outputExecCount, command, args)
 		outputExecCount++
 		if args[0] == "auth" && args[1] == "get-or-create-key" {
 			return "{\"key\":\"mysecurekey\"}", nil
@@ -197,13 +209,22 @@ func testOSDAgentWithDevicesHelper(t *testing.T, storeConfig rookalpha.StoreConf
 		return "", nil
 	}
 	executor.MockExecuteCommandWithOutput = func(debug bool, actionName string, command string, args ...string) (string, error) {
-		logger.Infof("OUTPUT %d for %s. %s %+v", outputExecCount, actionName, command, args)
+		logger.Infof("OUTPUT %d. %s %+v", outputExecCount, command, args)
 		outputExecCount++
 		if strings.HasPrefix(actionName, "lsblk /dev/disk/by-partuuid") {
 			// this is a call to get device properties so we figure out CRUSH weight, which should only be done for Bluestore
 			// (Filestore uses Statfs since it has a mounted filesystem)
 			assert.Equal(t, config.Bluestore, storeConfig.StoreType)
 			return `SIZE="1234567890" TYPE="part"`, nil
+		}
+		if command == "ceph-volume" {
+			if args[1] == "list" {
+				return `{}`, nil
+			}
+			if len(args) == 3 && args[2] == "--prepare" && legacyProvisioner {
+				// return an error for ceph-volume so we use the legacy provisioner
+				return ``, fmt.Errorf("ceph-volume not supported")
+			}
 		}
 		return "", nil
 	}
@@ -218,7 +239,7 @@ func testOSDAgentWithDevicesHelper(t *testing.T, storeConfig rookalpha.StoreConf
 	_, _, sdxUUID := mockPartitionSchemeEntry(t, 23, "sdx", &storeConfig, agent.kv, agent.nodeName)
 
 	// note only sdx already has a UUID (it's been through partitioning)
-	context.Devices = []*clusterd.LocalDisk{
+	context.Devices = []*sys.LocalDisk{
 		{Name: "sdx", Size: 1234567890, UUID: sdxUUID},
 		{Name: "sdy", Size: 1234567890},
 	}
@@ -226,19 +247,28 @@ func testOSDAgentWithDevicesHelper(t *testing.T, storeConfig rookalpha.StoreConf
 		"sdx": {Data: -1},
 		"sdy": {Data: -1},
 	}}
-	err = agent.configureDevices(context, devices)
+	_, err = agent.configureDevices(context, devices)
 	assert.Nil(t, err)
 
 	assert.Equal(t, int32(0), agent.configCounter)
-	assert.Equal(t, 2, startCount) // 2 OSD procs should be started
-	assert.Equal(t, 2, len(agent.osdProc), fmt.Sprintf("procs=%+v", agent.osdProc))
+	assert.Equal(t, 0, startCount) // 2 OSD procs should be started
 
-	if storeConfig.StoreType == config.Bluestore {
-		assert.Equal(t, 11, outputExecCount) // Bluestore has 2 extra output exec calls to get device properties of each device to determine CRUSH weight
+	if !legacyProvisioner {
+		if storeConfig.StoreType == config.Bluestore {
+			assert.Equal(t, 7, outputExecCount)
+			assert.Equal(t, 3, execCount)
+		} else {
+			assert.Equal(t, 6, outputExecCount)
+			// filestore on a device has two more calls than bluestore because of the mount/unmount commands of the legacy sdx device
+			// where sdy is created as the new c-v osd
+			assert.Equal(t, 5, execCount)
+		}
+	} else if storeConfig.StoreType == config.Bluestore {
+		assert.Equal(t, 12, outputExecCount) // Bluestore has 2 extra output exec calls to get device properties of each device to determine CRUSH weight
 		assert.Equal(t, 5, execCount)        // 1 osd mkfs for sdx, 3 partition steps for sdy, 1 osd mkfs for sdy
 	} else {
-		assert.Equal(t, 9, outputExecCount)
-		assert.Equal(t, 8, execCount) // 1 for remount sdx, 1 osd mkfs for sdx, 3 partition steps for sdy, 1 mkfs for sdy, 1 mount for sdy, 1 osd mkfs for sdy
+		assert.Equal(t, 10, outputExecCount)
+		assert.Equal(t, 10, execCount) // 1 for remount sdx, 1 osd mkfs for sdx, 3 partition steps for sdy, 1 mkfs for sdy, 1 mount for sdy, 1 osd mkfs for sdy
 	}
 }
 
@@ -255,7 +285,7 @@ func TestOSDAgentNoDevices(t *testing.T) {
 
 	startCount := 0
 	executor.MockStartExecuteCommand = func(debug bool, name string, command string, args ...string) (*exec.Cmd, error) {
-		logger.Infof("StartExecuteCommand: %s %v", command, args)
+		logger.Infof("StartExecuteCommand: %s %+v", command, args)
 		startCount++
 		cmd := &exec.Cmd{Args: append([]string{command}, args...)}
 		return cmd, nil
@@ -263,7 +293,7 @@ func TestOSDAgentNoDevices(t *testing.T) {
 
 	runCount := 0
 	executor.MockExecuteCommand = func(debug bool, name string, command string, args ...string) error {
-		logger.Infof("ExecuteCommand: %s %v", command, args)
+		logger.Infof("ExecuteCommand: %s %+v", command, args)
 		runCount++
 		createTestKeyring(t, configDir, args)
 		return nil
@@ -271,21 +301,21 @@ func TestOSDAgentNoDevices(t *testing.T) {
 
 	execWithOutputFileCount := 0
 	executor.MockExecuteCommandWithOutputFile = func(debug bool, actionName string, command string, outFileArg string, args ...string) (string, error) {
-		logger.Infof("ExecuteCommandWithOutputFile: %s %v", command, args)
+		logger.Infof("ExecuteCommandWithOutputFile: %s %+v", command, args)
 		execWithOutputFileCount++
 		return "{\"key\":\"mysecurekey\", \"osdid\":3.0}", nil
 	}
 
 	execWithOutputCount := 0
 	executor.MockExecuteCommandWithOutput = func(debug bool, actionName string, command string, arg ...string) (string, error) {
-		logger.Infof("ExecuteCommandWithOutput: %s %v", command, arg)
+		logger.Infof("ExecuteCommandWithOutput: %s %+v", command, arg)
 		execWithOutputCount++
 		return "", nil
 	}
 
 	// set up expected ProcManager commands
 	context := &clusterd.Context{
-		Devices:   []*clusterd.LocalDisk{},
+		Devices:   []*sys.LocalDisk{},
 		Executor:  executor,
 		ConfigDir: configDir,
 	}
@@ -293,13 +323,12 @@ func TestOSDAgentNoDevices(t *testing.T) {
 		filepath.Join(configDir, "sdx"): -1,
 		filepath.Join(configDir, "sdy"): -1,
 	}
-	err = agent.configureDirs(context, dirs)
+	_, err = agent.configureDirs(context, dirs)
 	assert.Nil(t, err)
 	assert.Equal(t, 2, runCount)
-	assert.Equal(t, 2, startCount)
+	assert.Equal(t, 0, startCount)
 	assert.Equal(t, 6, execWithOutputFileCount)
 	assert.Equal(t, 2, execWithOutputCount)
-	assert.Equal(t, 1, len(agent.osdProc))
 }
 
 func TestRemoveDevices(t *testing.T) {
@@ -308,14 +337,14 @@ func TestRemoveDevices(t *testing.T) {
 	os.MkdirAll(configDir, 0755)
 
 	nodeName := "node0347"
-	agent, mockExec, context := createTestAgent(t, "none", configDir, nodeName, &rookalpha.StoreConfig{StoreType: config.Bluestore})
-	agent.usingDeviceFilter = true
+	agent, mockExec, context := createTestAgent(t, "none", configDir, nodeName, &config.StoreConfig{StoreType: config.Bluestore})
+	agent.devices[0].IsFilter = true
 
 	_, removedDevices, _ := mockPartitionSchemeEntry(t, 1, "sdx", &agent.storeConfig, agent.kv, nodeName)
 
 	osdUsageCallCount := 0
 	mockExec.MockExecuteCommandWithOutputFile = func(debug bool, actionName, command, outputFile string, args ...string) (string, error) {
-		logger.Infof("Command: %s %v", command, args)
+		logger.Infof("Command: %s %+v", command, args)
 		if args[0] == "osd" && args[1] == "df" {
 			osdUsageCallCount++
 			if osdUsageCallCount == 1 {
@@ -338,21 +367,37 @@ func TestRemoveDevices(t *testing.T) {
 	assert.Nil(t, err)
 }
 
-func createTestAgent(t *testing.T, devices, configDir, nodeName string, storeConfig *rookalpha.StoreConfig) (*OsdAgent, *exectest.MockExecutor, *clusterd.Context) {
+func createTestAgent(t *testing.T, devices, configDir, nodeName string, storeConfig *config.StoreConfig) (*OsdAgent, *exectest.MockExecutor, *clusterd.Context) {
 	location := "root=here"
 	forceFormat := false
 	if storeConfig == nil {
-		storeConfig = &rookalpha.StoreConfig{StoreType: config.Bluestore}
+		storeConfig = &config.StoreConfig{StoreType: config.Bluestore}
+	}
+	var desiredDevices []DesiredDevice
+	testDevices := strings.Split(devices, ",")
+	for _, d := range testDevices {
+		desiredDevices = append(desiredDevices, DesiredDevice{Name: d, OSDsPerDevice: 1})
 	}
 
 	executor := &exectest.MockExecutor{
 		MockExecuteCommandWithOutputFile: func(debug bool, actionName string, command string, outFileArg string, args ...string) (string, error) {
+			logger.Infof("%s %v", command, args)
 			return "{\"key\":\"mysecurekey\", \"osdid\":3.0}", nil
 		},
+		MockExecuteCommandWithOutput: func(debug bool, actionName string, command string, args ...string) (string, error) {
+			logger.Infof("%s %v", command, args)
+			if command == "ceph-volume" {
+				if len(args) == 3 && args[0] == "lvm" && args[1] == "batch" && args[2] == "--prepare" {
+					logger.Infof("test c-v not supported")
+					return "", fmt.Errorf("c-v not supported")
+				}
+			}
+			return "", nil
+		},
 	}
-	cluster := &mon.ClusterInfo{Name: "myclust"}
+	cluster := &cephconfig.ClusterInfo{Name: "myclust"}
 	context := &clusterd.Context{ConfigDir: configDir, Executor: executor, Clientset: testop.New(1)}
-	agent := NewAgent(context, devices, false, "", "", forceFormat, location, *storeConfig,
+	agent := NewAgent(context, desiredDevices, "", "", forceFormat, location, *storeConfig,
 		cluster, nodeName, mockKVStore())
 
 	return agent, executor, context
@@ -372,17 +417,17 @@ func createTestKeyring(t *testing.T, configRoot string, args []string) {
 func TestGetPartitionPerfScheme(t *testing.T) {
 	configDir, _ := ioutil.TempDir("", "")
 	defer os.RemoveAll(configDir)
-	context := &clusterd.Context{Devices: []*clusterd.LocalDisk{}, ConfigDir: configDir}
+	context := &clusterd.Context{Devices: []*sys.LocalDisk{}, ConfigDir: configDir}
 	test.CreateConfigDir(configDir)
 
 	// 3 disks: 2 for data and 1 for the metadata of both disks (2 WALs and 2 DBs)
-	a := &OsdAgent{devices: "sda,sdb", metadataDevice: "sdc", kv: mockKVStore(), nodeName: "a"}
-	context.Devices = []*clusterd.LocalDisk{
+	a := &OsdAgent{devices: []DesiredDevice{{Name: "sda"}, {Name: "sdb"}}, metadataDevice: "sdc", kv: mockKVStore(), nodeName: "a"}
+	context.Devices = []*sys.LocalDisk{
 		{Name: "sda", Size: 107374182400}, // 100 GB
 		{Name: "sdb", Size: 107374182400}, // 100 GB
 		{Name: "sdc", Size: 44158681088},  // 1 MB (starting offset) + 2 * (576 MB + 20 GB) = 41.125 GB
 	}
-	clusterInfo := &mon.ClusterInfo{Name: "myclust"}
+	clusterInfo := &cephconfig.ClusterInfo{Name: "myclust"}
 	a.cluster = clusterInfo
 
 	// mock monitor command to return an osd ID when the client registers/creates an osd
@@ -394,10 +439,10 @@ func TestGetPartitionPerfScheme(t *testing.T) {
 				currOsdID++
 				return fmt.Sprintf(`{"osdid": %d}`, currOsdID), nil
 			}
-			return "", fmt.Errorf("unexpected command '%v'", args)
+			return "", fmt.Errorf("unexpected command '%+v'", args)
 		},
 		MockExecuteCommandWithOutput: func(debug bool, actionName string, command string, args ...string) (string, error) {
-			logger.Infof("Command: %s %v", command, args)
+			logger.Infof("Command: %s %+v", command, args)
 			if command == "lsblk" {
 				if args[0] == "/dev/sda" {
 					return `NAME="sda" SIZE="107374182400" TYPE="disk" PKNAME=""`, nil
@@ -412,17 +457,17 @@ func TestGetPartitionPerfScheme(t *testing.T) {
 			if command == "blkid" {
 				return "", nil
 			}
-			if command == "df" {
+			if command == "udevadm" {
 				return "", nil
 			}
-			return "", fmt.Errorf("unexpected command %s %v", command, args)
+			return "", fmt.Errorf("unexpected command %s %+v", command, args)
 		},
 	}
 	context.Executor = executor
 
-	devices, err := getAvailableDevices(context, "sda,sdb", "sdc", false)
+	devices, err := getAvailableDevices(context, []DesiredDevice{{Name: "sda"}, {Name: "sdb"}}, "sdc")
 	assert.Nil(t, err)
-	scheme, err := a.getPartitionPerfScheme(context, devices)
+	scheme, _, err := a.getPartitionPerfScheme(context, devices, false)
 	assert.Nil(t, err)
 	assert.Equal(t, 2, len(scheme.Entries))
 
@@ -465,7 +510,7 @@ func TestGetPartitionSchemeDiskInUse(t *testing.T) {
 
 	executor := &exectest.MockExecutor{
 		MockExecuteCommandWithOutput: func(debug bool, actionName string, command string, args ...string) (string, error) {
-			logger.Infof("Command: %s %v", command, args)
+			logger.Infof("Command: %s %+v", command, args)
 			if command == "lsblk" {
 				if args[0] == "/dev/sda" {
 					return `NAME="sda" SIZE="20971520000" TYPE="disk" PKNAME=""
@@ -476,29 +521,29 @@ func TestGetPartitionSchemeDiskInUse(t *testing.T) {
 			if command == "blkid" {
 				return "", nil
 			}
-			if command == "df" {
+			if command == "udevadm" {
 				return "", nil
 			}
-			return "", fmt.Errorf("unexpected command %s %v", command, args)
+			return "", fmt.Errorf("unexpected command %s %+v", command, args)
 		},
 	}
 	context := &clusterd.Context{
-		Devices:   []*clusterd.LocalDisk{},
+		Devices:   []*sys.LocalDisk{},
 		ConfigDir: configDir,
 		Executor:  executor,
 	}
 
-	a := &OsdAgent{devices: "sda", kv: mockKVStore()}
+	a := &OsdAgent{devices: []DesiredDevice{{Name: "sda"}}, kv: mockKVStore()}
 	_, _, sdaUUID := mockPartitionSchemeEntry(t, 1, "sda", nil, a.kv, a.nodeName)
 
-	context.Devices = []*clusterd.LocalDisk{
+	context.Devices = []*sys.LocalDisk{
 		{Name: "sda", Size: 107374182400, UUID: sdaUUID}, // 100 GB
 	}
 
 	// get the partition scheme based on the available devices.  Since sda is already in use, the partition
 	// scheme returned should reflect that.
-	devices, err := getAvailableDevices(context, "sda", "", false)
-	scheme, err := a.getPartitionPerfScheme(context, devices)
+	devices, err := getAvailableDevices(context, []DesiredDevice{{Name: "sda"}}, "")
+	scheme, _, err := a.getPartitionPerfScheme(context, devices, false)
 	assert.Nil(t, err)
 
 	// the partition scheme should have a single entry for osd 1 on sda and it should have collocated data and metadata
@@ -524,7 +569,7 @@ func TestGetPartitionSchemeDiskNameChanged(t *testing.T) {
 
 	executor := &exectest.MockExecutor{
 		MockExecuteCommandWithOutput: func(debug bool, actionName string, command string, args ...string) (string, error) {
-			logger.Infof("Command: %s %v", command, args)
+			logger.Infof("Command: %s %+v", command, args)
 			if command == "lsblk" {
 				if args[0] == "/dev/sda-changed" {
 					return `NAME="sda" SIZE="20971520000" TYPE="disk" PKNAME=""
@@ -540,39 +585,56 @@ func TestGetPartitionSchemeDiskNameChanged(t *testing.T) {
 			if command == "blkid" {
 				return "", nil
 			}
-			if command == "df" {
+			if command == "udevadm" {
 				return "", nil
 			}
-			return "", fmt.Errorf("unexpected command %s %v", command, args)
+			return "", fmt.Errorf("unexpected command %s %+v", command, args)
 		},
 	}
 	context := &clusterd.Context{
-		Devices:   []*clusterd.LocalDisk{},
+		Devices:   []*sys.LocalDisk{},
 		ConfigDir: configDir,
 		Executor:  executor,
 	}
 
 	// mock the currently discovered hardware, note the device names have changed (e.g., across reboots) but their UUIDs are always static
-	a := &OsdAgent{devices: "sda-changed", kv: mockKVStore()}
+	a := &OsdAgent{devices: []DesiredDevice{{Name: "sda-changed"}}, kv: mockKVStore()}
 
-	// setup an existing partition schme with metadata on nvme01 and data on sda
+	// setup an existing partition scheme with metadata on nvme01 and data on sda
 	_, metadataUUID, sdaUUID := mockDistributedPartitionScheme(t, 1, "nvme01", "sda", a.kv, a.nodeName)
 
-	context.Devices = []*clusterd.LocalDisk{
+	context.Devices = []*sys.LocalDisk{
 		{Name: "nvme01-changed", Size: 107374182400, UUID: metadataUUID},
 		{Name: "sda-changed", Size: 107374182400, UUID: sdaUUID},
 	}
 
 	// get the current partition scheme.  This should notice that the device names changed and update the
 	// partition scheme to have the latest device names
-	devices, err := getAvailableDevices(context, "sda-changed", "nvme01", false)
-	scheme, err := a.getPartitionPerfScheme(context, devices)
+	devices, err := getAvailableDevices(context, []DesiredDevice{{Name: "sda-changed"}}, "nvme01")
+	scheme, _, err := a.getPartitionPerfScheme(context, devices, false)
 	assert.Nil(t, err)
 	require.NotNil(t, scheme)
 	assert.Equal(t, "sda-changed", scheme.Entries[0].Partitions[config.BlockPartitionType].Device)
 	assert.Equal(t, "nvme01", scheme.Metadata.Device)
 	assert.Equal(t, "nvme01", scheme.Entries[0].Partitions[config.WalPartitionType].Device)
 	assert.Equal(t, "nvme01", scheme.Entries[0].Partitions[config.DatabasePartitionType].Device)
+
+	// new devices should be skipped for ceph-volume to configure.
+	logger.Infof("testing skipping new devices that should be configured by ceph-volume instead of with legacy")
+	context.Devices = []*sys.LocalDisk{
+		{Name: "sdx"},
+	}
+	devices = &DeviceOsdMapping{Entries: map[string]*DeviceOsdIDEntry{"nvme05": {Data: -1, Config: DesiredDevice{Name: "nvme05", OSDsPerDevice: 5}}}}
+	scheme, skipped, err := a.getPartitionPerfScheme(context, devices, true)
+	assert.Nil(t, err)
+	require.NotNil(t, scheme)
+	require.Equal(t, 1, len(skipped.Entries))
+	require.Equal(t, 1, len(scheme.Entries))
+	assert.Equal(t, "nvme05", skipped.Entries["nvme05"].Config.Name)
+	assert.Equal(t, 5, skipped.Entries["nvme05"].Config.OSDsPerDevice)
+	for _, p := range scheme.Entries[0].Partitions {
+		assert.NotEqual(t, "nvme05", p.Device)
+	}
 }
 
 func TestPrepareOSDRoot(t *testing.T) {
@@ -617,11 +679,11 @@ func verifyPartitionEntry(t *testing.T, actual *config.PerfSchemePartitionDetail
 	assert.Equal(t, expectedOffset, actual.OffsetMB)
 }
 
-func mockPartitionSchemeEntry(t *testing.T, osdID int, device string, storeConfig *rookalpha.StoreConfig,
+func mockPartitionSchemeEntry(t *testing.T, osdID int, device string, storeConfig *config.StoreConfig,
 	kv *k8sutil.ConfigMapKVStore, nodeName string) (entry *config.PerfSchemeEntry, scheme *config.PerfScheme, diskUUID string) {
 
 	if storeConfig == nil {
-		storeConfig = &rookalpha.StoreConfig{StoreType: config.Bluestore}
+		storeConfig = &config.StoreConfig{StoreType: config.Bluestore}
 	}
 
 	entry = config.NewPerfSchemeEntry(storeConfig.StoreType)
@@ -653,7 +715,7 @@ func mockDistributedPartitionScheme(t *testing.T, osdID int, metadataDevice, dev
 	entry.ID = osdID
 	entry.OsdUUID = uuid.Must(uuid.NewRandom())
 
-	config.PopulateDistributedPerfSchemeEntry(entry, device, scheme.Metadata, rookalpha.StoreConfig{})
+	config.PopulateDistributedPerfSchemeEntry(entry, device, scheme.Metadata, config.StoreConfig{})
 	scheme.Entries = append(scheme.Entries, entry)
 	err := scheme.SaveScheme(kv, config.GetConfigStoreName(nodeName))
 	assert.Nil(t, err)

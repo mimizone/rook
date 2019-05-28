@@ -18,12 +18,14 @@ package client
 import (
 	"encoding/json"
 	"fmt"
+	"syscall"
 
 	"strconv"
 
 	"regexp"
 
 	"github.com/rook/rook/pkg/clusterd"
+	"github.com/rook/rook/pkg/util/exec"
 )
 
 const (
@@ -31,14 +33,17 @@ const (
 )
 
 type CephBlockImage struct {
-	Name   string `json:"image"`
-	Size   uint64 `json:"size"`
-	Format int    `json:"format"`
+	Name     string `json:"image"`
+	Size     uint64 `json:"size"`
+	Format   int    `json:"format"`
+	InfoName string `json:"name"`
 }
 
 func ListImages(context *clusterd.Context, clusterName, poolName string) ([]CephBlockImage, error) {
 	args := []string{"ls", "-l", poolName}
-	buf, err := ExecuteRBDCommand(context, clusterName, args)
+	cmd := NewRBDCommand(context, clusterName, args)
+	cmd.JsonOutput = true
+	buf, err := cmd.Run()
 	if err != nil {
 		return nil, fmt.Errorf("failed to list images for pool %s: %+v", poolName, err)
 	}
@@ -61,7 +66,9 @@ func ListImages(context *clusterd.Context, clusterName, poolName string) ([]Ceph
 	return images, nil
 }
 
-func CreateImage(context *clusterd.Context, clusterName, name, poolName string, size uint64) (*CephBlockImage, error) {
+// CreateImage creates a block storage image.
+// If dataPoolName is not empty, the image will use poolName as the metadata pool and the dataPoolname for data.
+func CreateImage(context *clusterd.Context, clusterName, name, poolName, dataPoolName string, size uint64) (*CephBlockImage, error) {
 	if size > 0 && size < ImageMinSize {
 		// rbd tool uses MB as the smallest unit for size input.  0 is OK but anything else smaller
 		// than 1 MB should just be rounded up to 1 MB.
@@ -69,34 +76,37 @@ func CreateImage(context *clusterd.Context, clusterName, name, poolName string, 
 		size = ImageMinSize
 	}
 
-	sizeMB := int(size / 1024 / 1024)
+	// Roundup the size of the volume image since we only create images on 1MB bundaries and we should never create an image
+	// size that's smaller than the requested one, e.g, requested 1048698 bytes should be 2MB while not be truncated to 1MB
+	sizeMB := int((size + ImageMinSize - 1) / ImageMinSize)
+
 	imageSpec := getImageSpec(name, poolName)
 
 	args := []string{"create", imageSpec, "--size", strconv.Itoa(sizeMB)}
-	buf, err := ExecuteRBDCommandNoFormat(context, clusterName, args)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create image %s in pool %s of size %d: %+v. output: %s",
-			name, poolName, size, err, string(buf))
+
+	if dataPoolName != "" {
+		args = append(args, fmt.Sprintf("--data-pool=%s", dataPoolName))
 	}
 
-	// now that the image is created, retrieve it
-	images, err := ListImages(context, clusterName, poolName)
+	buf, err := NewRBDCommand(context, clusterName, args).Run()
 	if err != nil {
-		return nil, fmt.Errorf("failed to list images after successfully creating image %s: %v", name, err)
-	}
-	for i := range images {
-		if images[i].Name == name {
-			return &images[i], nil
+		cmdErr, ok := err.(*exec.CommandError)
+		if ok && cmdErr.ExitStatus() == int(syscall.EEXIST) {
+			// Image with the same name already exists in the given rbd pool. Continuing with the link to PV.
+			logger.Warningf("Requested image %s exists in pool %s. Continuing", name, poolName)
+		} else {
+			return nil, fmt.Errorf("failed to create image %s in pool %s of size %d: %+v. output: %s",
+				name, poolName, size, err, string(buf))
 		}
 	}
 
-	return nil, fmt.Errorf("failed to find image %s after creating it", name)
+	return &CephBlockImage{Name: name, Size: size}, nil
 }
 
 func DeleteImage(context *clusterd.Context, clusterName, name, poolName string) error {
 	imageSpec := getImageSpec(name, poolName)
 	args := []string{"rm", imageSpec}
-	buf, err := ExecuteRBDCommandNoFormat(context, clusterName, args)
+	buf, err := NewRBDCommand(context, clusterName, args).Run()
 	if err != nil {
 		return fmt.Errorf("failed to delete image %s in pool %s: %+v. output: %s",
 			name, poolName, err, string(buf))
@@ -106,12 +116,12 @@ func DeleteImage(context *clusterd.Context, clusterName, name, poolName string) 
 }
 
 // MapImage maps an RBD image using admin cephfx and returns the device path
-func MapImage(context *clusterd.Context, imageName, poolName, clusterName, keyring, monitors string) error {
+func MapImage(context *clusterd.Context, imageName, poolName, id, keyring, clusterName, monitors string) error {
 	imageSpec := getImageSpec(imageName, poolName)
 	args := []string{
 		"map",
 		imageSpec,
-		"--id", "admin",
+		fmt.Sprintf("--id=%s", id),
 		fmt.Sprintf("--cluster=%s", clusterName),
 		fmt.Sprintf("--keyring=%s", keyring),
 		"-m", monitors,
@@ -127,12 +137,12 @@ func MapImage(context *clusterd.Context, imageName, poolName, clusterName, keyri
 }
 
 // UnMapImage unmap an RBD image from the node
-func UnMapImage(context *clusterd.Context, imageName, poolName, clusterName, keyring, monitors string, force bool) error {
+func UnMapImage(context *clusterd.Context, imageName, poolName, id, keyring, clusterName, monitors string, force bool) error {
 	deviceImage := getImageSpec(imageName, poolName)
 	args := []string{
 		"unmap",
 		deviceImage,
-		"--id", "admin",
+		fmt.Sprintf("--id=%s", id),
 		fmt.Sprintf("--cluster=%s", clusterName),
 		fmt.Sprintf("--keyring=%s", keyring),
 		"-m", monitors,

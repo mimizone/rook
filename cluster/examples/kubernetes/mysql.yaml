@@ -19,20 +19,25 @@ metadata:
   labels:
     app: wordpress
 spec:
-  storageClassName: rook-block
+  storageClassName: rook-ceph-block
   accessModes:
   - ReadWriteOnce
   resources:
     requests:
       storage: 20Gi
 ---
-apiVersion: apps/v1beta1
+apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: wordpress-mysql
   labels:
     app: wordpress
+    tier: mysql
 spec:
+  selector:
+    matchLabels:
+      app: wordpress
+      tier: mysql
   strategy:
     type: Recreate
   template:

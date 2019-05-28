@@ -16,6 +16,7 @@
 .SUFFIXES:
 
 SHELL := /bin/bash
+SHA256CMD := shasum -a 256
 
 ifeq ($(origin PLATFORM), undefined)
 ifeq ($(origin GOOS), undefined)
@@ -39,10 +40,8 @@ ALL_PLATFORMS ?= darwin_amd64 windows_amd64 linux_amd64 linux_arm64
 
 ifeq ($(PLATFORM),linux_amd64)
 CROSS_TRIPLE = x86_64-linux-gnu
-DEBIAN_ARCH = amd64
 endif
 ifeq ($(PLATFORM),linux_arm64)
-DEBIAN_ARCH = arm64
 CROSS_TRIPLE = aarch64-linux-gnu
 endif
 ifeq ($(PLATFORM),darwin_amd64)
@@ -64,7 +63,7 @@ SED_CMD?=sed -i -e
 # set the version number. you should not need to do this
 # for the majority of scenarios.
 ifeq ($(origin VERSION), undefined)
-VERSION := $(shell git describe --dirty --always --tags | sed 's/-g/.g/g;s/-dirty/.dirty/g')
+VERSION := $(shell git describe --dirty --always --tags | sed 's/-/./2' | sed 's/-/./2' )
 endif
 export VERSION
 
@@ -93,8 +92,14 @@ endif
 
 # a registry that is scoped to the current build tree on this host
 ifeq ($(origin BUILD_REGISTRY), undefined)
-BUILD_REGISTRY := build-$(shell echo $(HOSTNAME)-$(ROOT_DIR) | shasum -a 256 | cut -c1-8)
+BUILD_REGISTRY := build-$(shell echo $(HOSTNAME)-$(ROOT_DIR) | $(SHA256CMD) | cut -c1-8)
 endif
+ifeq ($(BUILD_REGISTRY),build-)
+$(error Failed to get unique ID for host+dir. Check that '$(SHA256CMD)' functions or override SHA256CMD)
+endif
+
+# Select which images (backends) to make; default to all possible images
+IMAGES ?= ceph cockroachdb minio nfs cassandra edgefs
 
 COMMA := ,
 SPACE :=
